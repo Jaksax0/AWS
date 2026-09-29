@@ -1,0 +1,244 @@
+import pandas as pd
+import boto3
+import json
+from io import BytesIO
+import logging
+
+logger = logging.getLogger()
+logger.setLevel(logging.INFO)
+
+s3 = boto3.client("s3")
+
+CARD_STATS = None
+
+
+def get_card_stats(bucket):
+    global CARD_STATS
+
+    if CARD_STATS:
+        return CARD_STATS
+
+    response = s3.get_object(Bucket=bucket, Key="metadata/card_stats.json")
+
+    CARD_STATS = json.loads(response["Body"].read().decode("utf-8"))
+
+    return CARD_STATS
+
+
+def transform_logic(df, stats_dict):
+
+    if df.empty:
+        return df
+
+    cost_map = {k: v.get("cost", 0) for k, v in stats_dict.items()}
+    rarity_map = {k: v.get("rarity") for k, v in stats_dict.items()}
+
+    critical_cols = ["battleTime", "type", "arena.name", "p1.tag", "p2.tag"]
+    df = df.dropna(subset=[c for c in critical_cols if c in df.columns])
+
+    df["battle_timestamp"] = pd.to_datetime(
+        df["battleTime"],
+        format="%Y%m%dT%H%M%S.%fZ",
+        errors="coerce",
+    )
+
+    df = df.drop(columns=["battleTime"], errors="ignore")
+
+    df["p1.crowns"] = df["p1.crowns"].fillna(0)
+    df["p2.crowns"] = df["p2.crowns"].fillna(0)
+
+    df["p1_win"] = (df["p1.crowns"] > df["p2.crowns"]).astype(int)
+
+    for player in ["p1", "p2"]:
+        for i in range(1, 9):
+
+            level_col = f"{player}.c{i}.level"
+            max_col = f"{player}.c{i}.maxLevel"
+
+            if level_col in df.columns and max_col in df.columns:
+
+                df[level_col] = (
+                    df[level_col].fillna(1)
+                    + (16 - df[max_col].fillna(14))
+                )
+
+    level_cols = [c for c in df.columns if c.endswith(".level") and ".c" in c]
+    df[level_cols] = df[level_cols].clip(1, 16)
+
+    p1_cols = [c for c in df.columns if c.startswith("p1.")]
+
+    winner_data = {}
+    loser_data = {}
+
+    for col in p1_cols:
+
+        suffix = col.replace("p1.", "")
+        p2_col = f"p2.{suffix}"
+
+        if p2_col not in df.columns:
+            continue
+
+        winner_col = f"winner.{suffix}"
+        loser_col = f"loser.{suffix}"
+
+        winner_data[winner_col] = df[col].where(df["p1_win"] == 1, df[p2_col])
+        loser_data[loser_col] = df[p2_col].where(df["p1_win"] == 1, df[col])
+
+    df = pd.concat(
+        [
+            df.drop(columns=[c for c in df.columns if c.startswith(("p1.", "p2."))]),
+            pd.DataFrame(winner_data),
+            pd.DataFrame(loser_data),
+        ],
+        axis=1,
+    )
+
+    rarities = ["common", "rare", "epic", "legendary", "champion"]
+
+    for role in ["winner", "loser"]:
+
+        name_cols = [f"{role}.c{i}.name" for i in range(1, 9)]
+        level_cols = [f"{role}.c{i}.level" for i in range(1, 9)]
+        evo_cols = [f"{role}.c{i}.evo" for i in range(1, 9)]
+
+        df[f"{role}.total_card_level"] = df[level_cols].sum(axis=1)
+        df[f"{role}.avg_card_level"] = df[level_cols].mean(axis=1).round(2)
+
+        elixir_df = df[name_cols].replace(cost_map)
+        df[f"{role}.avg_elixir"] = elixir_df.mean(axis=1).round(2)
+
+        rarity_df = df[name_cols].replace(rarity_map)
+
+        for r in rarities:
+            df[f"{role}.{r}_count"] = (rarity_df == r).sum(axis=1)
+
+        df[f"{role}.evo_count"] = (df[evo_cols] == 1).sum(axis=1)
+        df[f"{role}.hero_count"] = (df[evo_cols] == 2).sum(axis=1)
+
+    for role in ["winner", "loser"]:
+
+        level_col = f"{role}.tower_level"
+        max_col = f"{role}.tower_maxLevel"
+
+        if level_col in df.columns and max_col in df.columns:
+
+            df[level_col] = (
+                df[level_col].fillna(14)
+                + (16 - df[max_col].fillna(14))
+            )
+
+    tower_cols = [c for c in df.columns if "tower_level" in c]
+    df[tower_cols] = df[tower_cols].clip(1, 16)
+
+    df = df.drop(columns=[c for c in df.columns if "maxLevel" in c], errors="ignore")
+
+    df = df.drop(columns=["p1_win"], errors="ignore")
+
+    int_cols = []
+    for role in ["winner", "loser"]:
+        int_cols += [
+            f"{role}.trophyChange",
+            f"{role}.crowns",
+            f"{role}.kingHP",
+            f"{role}.tower_level",
+            f"{role}.total_card_level",
+            f"{role}.evo_count",
+            f"{role}.hero_count",
+        ]
+        int_cols += [f"{role}.{r}_count" for r in rarities]
+        for i in range(1, 9):
+            int_cols += [f"{role}.c{i}.level", f"{role}.c{i}.evo"]
+    for col in int_cols:
+        if col in df.columns:
+            df[col] = df[col].fillna(0).astype("int64")
+
+    meta_cols = [
+        "battle_timestamp",
+        "type",
+        "arena.name",
+    ]
+
+    def build_role_columns(role):
+
+        info_cols = [
+            f"{role}.tag",
+            f"{role}.name",
+            f"{role}.startingTrophies",
+            f"{role}.trophyChange",
+            f"{role}.crowns",
+            f"{role}.kingHP",
+            f"{role}.towerHPs",
+            f"{role}.tower_name",
+            f"{role}.tower_level",
+        ]
+
+        stats_cols = [
+            f"{role}.avg_elixir",
+            f"{role}.total_card_level",
+            f"{role}.avg_card_level",
+            f"{role}.evo_count",
+            f"{role}.hero_count",
+        ] + [f"{role}.{r}_count" for r in rarities]
+
+        card_cols = []
+
+        for i in range(1, 9):
+            card_cols.extend(
+                [
+                    f"{role}.c{i}.name",
+                    f"{role}.c{i}.level",
+                    f"{role}.c{i}.evo",
+                ]
+            )
+
+        return info_cols + stats_cols + card_cols
+
+    final_columns = (
+        meta_cols
+        + build_role_columns("winner")
+        + build_role_columns("loser")
+    )
+
+    existing_columns = [c for c in final_columns if c in df.columns]
+
+    return df[existing_columns]
+
+
+def lambda_handler(event, context):
+
+    try:
+
+        bucket = event["Records"][0]["s3"]["bucket"]["name"]
+        key = event["Records"][0]["s3"]["object"]["key"]
+
+        logger.info(f"Processing file: {key}")
+
+        stats = get_card_stats(bucket)
+
+        response = s3.get_object(Bucket=bucket, Key=key)
+
+        df = pd.read_parquet(BytesIO(response["Body"].read()))
+
+        logger.info(f"Rows before transform: {len(df)}")
+
+        df_processed = transform_logic(df, stats)
+
+        logger.info(f"Rows after transform: {len(df_processed)}")
+
+        output_key = key.replace("final_raw/", "silver/")
+
+        buffer = BytesIO()
+        df_processed.to_parquet(buffer, index=False)
+
+        s3.put_object(
+            Bucket=bucket,
+            Key=output_key,
+            Body=buffer.getvalue(),
+        )
+
+        return {"status": "success", "file": output_key}
+
+    except Exception as e:
+
+        logger.error(str(e))
+        raise

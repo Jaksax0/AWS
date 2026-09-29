@@ -1,0 +1,60 @@
+import os
+import boto3
+import pandas as pd
+from io import BytesIO
+import logging
+from datetime import datetime
+
+S3_BUCKET = os.environ["S3_BUCKET"]
+BATCH_LIMIT = 10000
+
+s3 = boto3.client('s3')
+logger = logging.getLogger()
+logger.setLevel(logging.INFO)
+
+
+def lambda_handler(event, context):
+    res = s3.list_objects_v2(Bucket=S3_BUCKET, Prefix="raw/")
+
+    if 'Contents' not in res:
+        return {"status": "empty", "message": "Brak plików w raw/"}
+
+    files = [obj['Key'] for obj in res['Contents'] if obj['Key'].endswith('.parquet')]
+
+    all_dfs = []
+    processed_keys = []
+    total_rows = 0
+
+    for key in files:
+        obj = s3.get_object(Bucket=S3_BUCKET, Key=key)
+        df = pd.read_parquet(BytesIO(obj['Body'].read()))
+
+        all_dfs.append(df)
+        processed_keys.append({'Key': key})
+        total_rows += len(df)
+
+        if total_rows >= BATCH_LIMIT:
+            break
+
+    if total_rows < BATCH_LIMIT:
+        logger.info(f"Obecnie w raw/ jest {total_rows} bitew. Czekam na więcej (cel: {BATCH_LIMIT}).")
+        return {"status": "buffering", "current_count": total_rows}
+
+    final_df = pd.concat(all_dfs, ignore_index=True)
+
+    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    final_key = f"final_raw/batch_10k_{timestamp}.parquet"
+
+    buf = BytesIO()
+    final_df.to_parquet(buf, index=False)
+    s3.put_object(Bucket=S3_BUCKET, Key=final_key, Body=buf.getvalue())
+
+    s3.delete_objects(Bucket=S3_BUCKET, Delete={'Objects': processed_keys})
+
+    logger.info(f"Utworzono paczkę: {final_key} (Bitew: {len(final_df)})")
+    return {
+        "status": "success",
+        "final_file": final_key,
+        "rows_processed": len(final_df),
+        "files_merged": len(processed_keys)
+    }

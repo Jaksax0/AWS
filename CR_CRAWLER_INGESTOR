@@ -1,0 +1,185 @@
+import os
+import boto3
+import requests
+import hashlib
+import pandas as pd
+import logging
+import random
+from io import BytesIO
+from datetime import datetime
+from boto3.dynamodb.conditions import Key
+
+TOKEN = os.environ["CR_API_TOKEN"]
+S3_BUCKET = os.environ["S3_BUCKET"]
+QUEUE_TABLE = os.environ.get("QUEUE_TABLE", "PlayerQueue")
+SEEN_TABLE = os.environ.get("SEEN_TABLE", "BattlesSeen")
+FALLBACK_PLAYER_TAG = os.environ.get("FALLBACK_PLAYER_TAG")
+
+BASE = "https://api.clashroyale.com/v1"
+HEADERS = {"Authorization": f"Bearer {TOKEN}", "Accept": "application/json"}
+
+TROPHY_MIN = 7000
+TROPHY_MAX = 11000
+MAX_PLAYERS_PER_RUN = 1000
+
+dynamodb = boto3.resource('dynamodb')
+s3 = boto3.client('s3')
+
+table_queue = dynamodb.Table(QUEUE_TABLE)
+table_seen = dynamodb.Table(SEEN_TABLE)
+
+logger = logging.getLogger()
+logger.setLevel(logging.INFO)
+
+session = requests.Session()
+REQUEST_TIMEOUT = 10
+
+
+def extract_raw_battle(b):
+    b_type = b.get("type", "unknown")
+    if b_type not in ["PvP", "ranked"]:
+        return None
+    try:
+        team, opp = b["team"][0], b["opponent"][0]
+        p1_trophies = team.get("startingTrophies") or team.get("trophies", 0)
+        if not (TROPHY_MIN <= p1_trophies <= TROPHY_MAX):
+            return None
+        row = {
+            "battleTime": b["battleTime"],
+            "type": b_type,
+            "arena_name": b.get("arena", {}).get("name"),
+            "p1.tag": team.get("tag"),
+            "p1.name": team.get("name"),
+            "p1.startingTrophies": p1_trophies,
+            "p1.crowns": team.get("crowns"),
+            "p1.trophyChange": team.get("trophyChange", 0),
+            "p1.kingHP": team.get("kingTowerHitPoints", 0),
+            "p1.towerHPs": team.get("princessTowersHitPoints") or [],
+            "p2.tag": opp.get("tag"),
+            "p2.name": opp.get("name"),
+            "p2.startingTrophies": opp.get("startingTrophies") or opp.get("trophies", 0),
+            "p2.crowns": opp.get("crowns"),
+            "p2.trophyChange": opp.get("trophyChange", 0),
+            "p2.kingHP": opp.get("kingTowerHitPoints", 0),
+            "p2.towerHPs": opp.get("princessTowersHitPoints") or [],
+        }
+        for i, player in enumerate([team, opp], 1):
+            pref = f"p{i}"
+            support = player.get("supportCards", [])
+            tower_troops = player.get("towerTroops", [])
+            if support:
+                tower = support[0]
+                row[f"{pref}.tower_name"] = tower.get("name")
+                row[f"{pref}.tower_level"] = tower.get("level")
+                row[f"{pref}.tower_maxLevel"] = tower.get("maxLevel")
+            elif tower_troops:
+                tower = tower_troops[0]
+                row[f"{pref}.tower_name"] = tower.get("name")
+                row[f"{pref}.tower_level"] = tower.get("level")
+                row[f"{pref}.tower_maxLevel"] = tower.get("maxLevel")
+            else:
+                row[f"{pref}.tower_name"] = "Tower Princess"
+                row[f"{pref}.tower_level"] = player.get("expLevel")
+                row[f"{pref}.tower_maxLevel"] = None
+            cards = player.get("cards", [])
+            for j in range(8):
+                cp = f"{pref}.c{j+1}"
+                if j < len(cards):
+                    card = cards[j]
+                    row[f"{cp}.name"] = card.get("name")
+                    row[f"{cp}.level"] = card.get("level")
+                    row[f"{cp}.maxLevel"] = card.get("maxLevel")
+                    row[f"{cp}.evo"] = card.get("evolutionLevel", 0)
+        return row
+    except Exception as e:
+        logger.error(f"Error: {e}")
+        return None
+
+
+def lambda_handler(event, context):
+    rows_buffer = []
+    res = table_queue.query(
+        IndexName='ProcessedIndex',
+        KeyConditionExpression=Key('processed').eq(0),
+        Limit=MAX_PLAYERS_PER_RUN
+    )
+    players = res.get('Items', [])
+    if not players:
+        try:
+            lb = session.get(
+                f"{BASE}/locations/global/rankings/players?limit=50",
+                headers=HEADERS,
+                timeout=REQUEST_TIMEOUT
+            )
+            if lb.status_code == 200:
+                top_players = lb.json().get("items", [])
+                seeded = 0
+                with table_queue.batch_writer() as batch:
+                    for p in top_players:
+                        tag = p.get("tag")
+                        if tag:
+                            batch.put_item(Item={"tag": tag, "processed": 0})
+                            seeded += 1
+                logger.info(f"Reseeded queue with {seeded} leaderboard players")
+                return {"status": "reseeded", "count": seeded}
+        except Exception as e:
+            logger.error(f"Leaderboard reseed failed: {e}")
+        if FALLBACK_PLAYER_TAG:
+            table_queue.put_item(Item={'tag': FALLBACK_PLAYER_TAG, 'processed': 0})
+        return {"status": "restarted"}
+    for p_item in players:
+        tag = p_item['tag']
+        tag_enc = tag.replace("#", "%23")
+        try:
+            res = session.get(
+                f"{BASE}/players/{tag_enc}/battlelog",
+                headers=HEADERS,
+                timeout=REQUEST_TIMEOUT
+            )
+        except Exception as e:
+            logger.error(f"API error for {tag}: {e}")
+            continue
+        if res.status_code != 200:
+            continue
+        battles = res.json()
+        for b in battles:
+            row = extract_raw_battle(b)
+            if not row:
+                continue
+            try:
+                p1_tag = tag
+                p2_tag = b['opponent'][0]['tag']
+                sorted_tags = sorted([p1_tag, p2_tag])
+                b_hash = hashlib.md5(
+                    f"{b['battleTime']}{sorted_tags[0]}{sorted_tags[1]}".encode()
+                ).hexdigest()
+            except (KeyError, IndexError):
+                continue
+            try:
+                table_seen.put_item(
+                    Item={'battle_hash': b_hash},
+                    ConditionExpression='attribute_not_exists(battle_hash)'
+                )
+            except table_seen.meta.client.exceptions.ConditionalCheckFailedException:
+                continue
+            rows_buffer.append(row)
+            try:
+                if random.random() < 0.10:
+                    opp_tag = b['opponent'][0]['tag']
+                    table_queue.put_item(
+                        Item={'tag': opp_tag, 'processed': 0},
+                        ConditionExpression='attribute_not_exists(tag)'
+                    )
+            except Exception:
+                pass
+        table_queue.delete_item(Key={'tag': tag})
+    if rows_buffer:
+        df = pd.DataFrame(rows_buffer)
+        buf = BytesIO()
+        df.to_parquet(buf, index=False)
+        f_name = f"raw/arena_{datetime.now().strftime('%Y%m%d_%H%M%S')}.parquet"
+        s3.put_object(Bucket=S3_BUCKET, Key=f_name, Body=buf.getvalue())
+    return {
+        "processed": len(players),
+        "collected": len(rows_buffer)
+    }

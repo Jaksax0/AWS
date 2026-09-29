@@ -1,0 +1,59 @@
+import os
+import boto3
+import pandas as pd
+import re
+import io
+
+BUCKET = os.environ["S3_BUCKET"]
+PREFIX = "silver/"
+
+DROP_COLS = [
+    "type",
+    "winner_name",   "winner_tower_name",  "winner_tower_level",
+    "loser_name",    "loser_tower_name",   "loser_tower_level",
+]
+
+
+def to_snake_case(col: str) -> str:
+    col = col.replace(".", "_")
+    col = re.sub(r"([a-z])([A-Z])", r"\1_\2", col)
+    return col.lower()
+
+
+def list_parquet_files(bucket: str, prefix: str) -> list[str]:
+    s3 = boto3.client("s3")
+    paginator = s3.get_paginator("list_objects_v2")
+    keys = []
+    for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
+        for obj in page.get("Contents", []):
+            if obj["Key"].endswith(".parquet"):
+                keys.append(obj["Key"])
+    return keys
+
+
+def process_file(s3_client, bucket: str, key: str) -> tuple[int, int]:
+    buf = io.BytesIO(s3_client.get_object(Bucket=bucket, Key=key)["Body"].read())
+    df = pd.read_parquet(buf)
+
+    df.columns = [to_snake_case(c) for c in df.columns]
+    df = df.drop(columns=[c for c in DROP_COLS if c in df.columns])
+
+    out = io.BytesIO()
+    df.to_parquet(out, index=False, engine="pyarrow")
+    out.seek(0)
+    s3_client.put_object(Bucket=bucket, Key=key, Body=out.getvalue())
+
+    return df.shape
+
+
+s3 = boto3.client("s3")
+
+files = list_parquet_files(BUCKET, PREFIX)
+print(f"Znaleziono {len(files)} plików Parquet w s3://{BUCKET}/{PREFIX}")
+
+for key in files:
+    print(f"  Przetwarzam: {key}")
+    rows, cols = process_file(s3, BUCKET, key)
+    print(f"    → {rows:,} wierszy, {cols} kolumn")
+
+print("Gotowe")
